@@ -17,6 +17,7 @@ export interface IntegrationsStatus {
   autoScheduleEnabled: boolean;
   shopeeAppIdPreview: string;
   telegramChatId: string;
+  ffmpegAvailable?: boolean;
 }
 
 export interface RenderedVideoFile {

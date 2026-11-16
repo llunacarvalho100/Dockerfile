@@ -5,6 +5,7 @@ import {
   INITIAL_SLOTS,
   appendHistory,
   buildDefaultCopyTemplate,
+  buildFallbackCatalogState,
   buildFfmpegFilterComplex,
   buildTelegramOperationalMessage,
   calculateConversionIndex,
@@ -151,3 +152,14 @@ test('getNextScheduledSlot picks nearest upcoming daily slot', () => {
   assert.equal(nextDay.slot.slot, 1);
   assert.equal(nextDay.slot.time, '08:30');
 });
+
+test('buildFallbackCatalogState provides immediate prioritized catalog for offline/timeout fallback', () => {
+  const fallback = buildFallbackCatalogState('/tmp/shopee-studio');
+  assert.equal(fallback.shopeeMode, 'catalog');
+  assert.equal(fallback.dataDir, '/tmp/shopee-studio');
+  assert.equal(fallback.slots.length, 3);
+  assert.ok(fallback.catalog.length >= 6);
+  assert.equal(fallback.catalog[0].itemId, '22984710531');
+  assert.equal(fallback.integrationsStatus.ffmpegAvailable, false);
+});
+

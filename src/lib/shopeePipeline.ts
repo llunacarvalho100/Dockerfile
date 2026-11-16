@@ -450,3 +450,25 @@ export function buildDefaultCopyTemplate(produto: ShopeeProduct): VideoCopyPacka
     google_flow: buildDefaultGoogleFlowPackage(produto, searchTerm),
   };
 }
+
+export function buildFallbackCatalogState(dataDir = './data') {
+  const catalog = sortProductsByPriority(CATALOG_SEED_PRODUCTS);
+  return {
+    catalog,
+    shopeeMode: 'catalog' as const,
+    history: [] as PostedHistoryEntry[],
+    slots: INITIAL_SLOTS.map((s) => ({ ...s })),
+    renderedVideos: [],
+    dataDir,
+    integrationsStatus: {
+      shopeeConfigured: false,
+      telegramConfigured: false,
+      geminiConfigured: false,
+      autoScheduleEnabled: false,
+      shopeeAppIdPreview: '',
+      telegramChatId: '',
+      ffmpegAvailable: false,
+    },
+  };
+}
+

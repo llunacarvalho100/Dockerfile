@@ -44,6 +44,7 @@ interface StudioWorkspaceProps {
   audioUrl: string | null;
   audioFilename: string | null;
   videoUrl: string | null;
+  videoFilename?: string | null;
   isGeneratingAudio: boolean;
   isRenderingVideo: boolean;
   isGeneratingVeo: boolean;
@@ -80,6 +81,7 @@ export function StudioWorkspace({
   audioUrl,
   audioFilename,
   videoUrl,
+  videoFilename,
   isGeneratingAudio,
   isRenderingVideo,
   isGeneratingVeo,
@@ -589,6 +591,7 @@ export function StudioWorkspace({
             audioUrl={audioUrl}
             audioFilename={audioFilename}
             videoUrl={videoUrl}
+            videoFilename={videoFilename}
             isGeneratingAudio={isGeneratingAudio}
             isRenderingVideo={isRenderingVideo}
             isGeneratingVeo={isGeneratingVeo}

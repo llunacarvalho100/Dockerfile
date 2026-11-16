@@ -18,9 +18,15 @@ import type {
 } from './types.ts';
 import {
   buildDefaultCopyTemplate,
+  buildFallbackCatalogState,
   getProductEligibilityReason,
   selectNextEligibleProduct,
 } from './lib/shopeePipeline.ts';
+import {
+  fetchWithTimeout,
+  muxFlowVideoInBrowser,
+  renderKenBurnsVideoInBrowser,
+} from './lib/browserVideoRenderer.ts';
 import { StudioWorkspace } from './components/StudioWorkspace.tsx';
 import { CurationTable } from './components/CurationTable.tsx';
 import { HistoryLedger } from './components/HistoryLedger.tsx';
@@ -103,7 +109,7 @@ export default function App() {
   const fetchState = useCallback(
     async (preserveSelection = true) => {
       try {
-        const res = await fetch('/api/state');
+        const res = await fetchWithTimeout('/api/state', undefined, 4000);
         if (!res.ok) throw new Error('Falha ao carregar estado do servidor.');
         const data = (await res.json()) as AppStateResponse;
         setAppState(data);
@@ -113,8 +119,16 @@ export default function App() {
           const next = selectNextEligibleProduct(data.catalog, postedIds);
           loadProductIntoStudio(next);
         }
-      } catch (err) {
-        setErrorBanner(err instanceof Error ? err.message : 'Erro ao conectar com servidor.');
+      } catch {
+        const fallback = buildFallbackCatalogState();
+        setAppState((prev) => prev ?? fallback);
+        if (!preserveSelection || !selectedProduct) {
+          const next = selectNextEligibleProduct(fallback.catalog, []);
+          loadProductIntoStudio(next);
+        }
+        setSuccessBanner(
+          'Catálogo de demonstração local carregado (API indisponível ou tempo limite de 4s excedido).'
+        );
       } finally {
         setLoading(false);
       }
@@ -220,21 +234,61 @@ export default function App() {
     setIsRenderingVideo(true);
     setErrorBanner(null);
     try {
-      const res = await fetch('/api/video/render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          produto: selectedProduct,
-          slotNumber: activeSlot,
-          audioFilename,
+      let data: {
+        requiresClientRender?: boolean;
+        videoUrl?: string;
+        filename?: string;
+        fallbackReason?: string;
+        error?: string;
+      } | null = null;
+
+      try {
+        const res = await fetchWithTimeout(
+          '/api/video/render',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              produto: selectedProduct,
+              slotNumber: activeSlot,
+              audioFilename,
+              durationSec: audioDuration,
+            }),
+          },
+          30000
+        );
+        data = await res.json();
+        if (!res.ok && !data?.requiresClientRender) {
+          throw new Error(data?.error || 'FFmpeg indisponível no servidor.');
+        }
+      } catch {
+        data = {
+          requiresClientRender: true,
+          fallbackReason:
+            'Renderização no servidor indisponível; gerando vídeo 9:16 via Canvas + MediaRecorder no navegador.',
+        };
+      }
+
+      if (data?.requiresClientRender || !data?.videoUrl) {
+        const rendered = await renderKenBurnsVideoInBrowser({
+          imageUrl: selectedProduct.imageUrl,
+          title: copy.titulo_curto_capa,
+          audioUrl,
           durationSec: audioDuration,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Falha ao renderizar vídeo MP4.');
-      setVideoUrl(data.videoUrl);
-      setVideoFilename(data.filename);
-      setSuccessBanner('Vídeo vertical 9:16 (MP4) renderizado com FFmpeg.');
+          itemId: selectedProduct.itemId,
+          slotNumber: activeSlot,
+        });
+        setVideoUrl(rendered.videoUrl);
+        setVideoFilename(rendered.filename);
+        setSuccessBanner(
+          data?.fallbackReason ||
+            'Vídeo vertical 9:16 gerado no navegador via Canvas + MediaRecorder.'
+        );
+      } else {
+        setVideoUrl(data.videoUrl);
+        setVideoFilename(data.filename || null);
+        setSuccessBanner('Vídeo vertical 9:16 (MP4) renderizado com FFmpeg.');
+      }
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Erro ao renderizar vídeo.');
     } finally {
@@ -247,26 +301,67 @@ export default function App() {
     setIsGeneratingVeo(true);
     setErrorBanner(null);
     try {
-      const res = await fetch('/api/flow/generate-veo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          produto: selectedProduct,
-          veoMasterPrompt: copy.google_flow?.veo_master_prompt,
-          slotNumber: activeSlot,
-          audioFilename,
+      let data: {
+        requiresClientRender?: boolean;
+        videoUrl?: string;
+        filename?: string;
+        engine?: string;
+        fallbackReason?: string;
+        error?: string;
+      } | null = null;
+
+      try {
+        const res = await fetchWithTimeout(
+          '/api/flow/generate-veo',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              produto: selectedProduct,
+              veoMasterPrompt: copy.google_flow?.veo_master_prompt,
+              slotNumber: activeSlot,
+              audioFilename,
+              durationSec: audioDuration,
+            }),
+          },
+          65000
+        );
+        data = await res.json();
+        if (!res.ok && !data?.requiresClientRender) {
+          throw new Error(data?.error || 'Falha ao gerar cena com Veo.');
+        }
+      } catch {
+        data = {
+          requiresClientRender: true,
+          fallbackReason:
+            'Veo/FFmpeg indisponível no servidor Serverless; cena 9:16 gerada no navegador via Canvas + MediaRecorder.',
+        };
+      }
+
+      if (data?.requiresClientRender || !data?.videoUrl) {
+        const rendered = await renderKenBurnsVideoInBrowser({
+          imageUrl: selectedProduct.imageUrl,
+          title: copy.titulo_curto_capa,
+          audioUrl,
           durationSec: audioDuration,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Falha ao gerar cena com Veo.');
-      setVideoUrl(data.videoUrl);
-      setVideoFilename(data.filename);
-      setSuccessBanner(
-        data.engine === 'veo_2'
-          ? 'Cena vertical 9:16 gerada com Veo 2.0 e pronta para envio!'
-          : data.fallbackReason || 'Vídeo 9:16 gerado via fallback FFmpeg Ken Burns.'
-      );
+          itemId: selectedProduct.itemId,
+          slotNumber: activeSlot,
+        });
+        setVideoUrl(rendered.videoUrl);
+        setVideoFilename(rendered.filename);
+        setSuccessBanner(
+          data?.fallbackReason ||
+            'Cena 9:16 gerada no navegador via Canvas + MediaRecorder.'
+        );
+      } else {
+        setVideoUrl(data.videoUrl);
+        setVideoFilename(data.filename || null);
+        setSuccessBanner(
+          data.engine === 'veo_2'
+            ? 'Cena vertical 9:16 gerada com Veo 2.0 e pronta para envio!'
+            : data.fallbackReason || 'Vídeo 9:16 gerado via fallback FFmpeg Ken Burns.'
+        );
+      }
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Erro ao gerar cena com Veo.');
     } finally {
@@ -284,20 +379,60 @@ export default function App() {
         slotNumber: String(activeSlot),
         ...(audioFilename ? { audioFilename } : {}),
       });
-      const res = await fetch(`/api/flow/mux-custom-video?${params.toString()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'video/mp4' },
-        body: file,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Falha ao mixar vídeo do Google Flow.');
-      setVideoUrl(data.videoUrl);
-      setVideoFilename(data.filename);
-      setSuccessBanner(
-        data.audioMuxed
-          ? 'Vídeo do Google Flow normalizado em 1080×1920 com voz em português mixada!'
-          : 'Vídeo do Google Flow normalizado em 1080×1920 (gere o áudio antes se quiser mixar a locução).'
-      );
+      let data: {
+        requiresClientRender?: boolean;
+        videoUrl?: string;
+        filename?: string;
+        audioMuxed?: boolean;
+        fallbackReason?: string;
+        error?: string;
+      } | null = null;
+
+      try {
+        const res = await fetchWithTimeout(
+          `/api/flow/mux-custom-video?${params.toString()}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'video/mp4' },
+            body: file,
+          },
+          45000
+        );
+        data = await res.json();
+        if (!res.ok && !data?.requiresClientRender) {
+          throw new Error(data?.error || 'Falha ao mixar vídeo do Google Flow.');
+        }
+      } catch {
+        data = {
+          requiresClientRender: true,
+          fallbackReason:
+            'FFmpeg indisponível no servidor; vídeo do Google Flow processado no navegador.',
+        };
+      }
+
+      if (data?.requiresClientRender || !data?.videoUrl) {
+        const muxed = await muxFlowVideoInBrowser({
+          file,
+          audioUrl,
+          itemId: selectedProduct.itemId,
+          slotNumber: activeSlot,
+        });
+        setVideoUrl(muxed.videoUrl);
+        setVideoFilename(muxed.filename);
+        setSuccessBanner(
+          audioUrl
+            ? 'Vídeo do Google Flow mixado com locução diretamente no navegador (Canvas + MediaRecorder)!'
+            : 'Vídeo do Google Flow carregado no Palco 9:16!'
+        );
+      } else {
+        setVideoUrl(data.videoUrl);
+        setVideoFilename(data.filename || null);
+        setSuccessBanner(
+          data.audioMuxed
+            ? 'Vídeo do Google Flow normalizado em 1080×1920 com voz em português mixada!'
+            : 'Vídeo do Google Flow normalizado em 1080×1920 (gere o áudio antes se quiser mixar a locução).'
+        );
+      }
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Erro ao importar vídeo .mp4 do Google Flow.');
     } finally {
@@ -349,7 +484,26 @@ export default function App() {
       setSelectedProduct(data.produto);
       setCopy(data.copy);
       setAudioUrl(data.audioUrl);
-      setVideoUrl(data.videoUrl);
+      setAudioFilename(data.audioFilename || null);
+      setAudioDuration(data.audioDuration || 10);
+
+      let finalVideoUrl: string | null = data.videoUrl;
+      let finalVideoFilename: string | null = data.videoFilename || null;
+      if (data.requiresClientRender || !finalVideoUrl) {
+        const rendered = await renderKenBurnsVideoInBrowser({
+          imageUrl: data.produto.imageUrl,
+          title: data.copy.titulo_curto_capa,
+          audioUrl: data.audioUrl,
+          durationSec: data.audioDuration || 6,
+          itemId: data.produto.itemId,
+          slotNumber: activeSlot,
+        });
+        finalVideoUrl = rendered.videoUrl;
+        finalVideoFilename = rendered.filename;
+      }
+
+      setVideoUrl(finalVideoUrl);
+      setVideoFilename(finalVideoFilename);
       setAppState((prev) =>
         prev ? { ...prev, history: data.history, slots: data.slots } : prev
       );
@@ -567,6 +721,7 @@ export default function App() {
                   audioUrl={audioUrl}
                   audioFilename={audioFilename}
                   videoUrl={videoUrl}
+                  videoFilename={videoFilename}
                   isGeneratingAudio={isGeneratingAudio}
                   isRenderingVideo={isRenderingVideo}
                   isGeneratingVeo={isGeneratingVeo}

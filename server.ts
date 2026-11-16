@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   CATALOG_SEED_PRODUCTS,
@@ -28,13 +27,37 @@ const execFileAsync = promisify(execFile);
 
 const PORT = 3000;
 const SHOPEE_GRAPHQL_URL = 'https://open-api.affiliate.shopee.com.br/graphql';
-const DATA_DIR_RAW = process.env.DATA_DIR || './data';
-const DATA_DIR = path.resolve(process.cwd(), DATA_DIR_RAW);
+const IS_VERCEL = Boolean(process.env.VERCEL);
+const VERCEL_TMP_DIR = '/tmp/shopee-studio';
+const DATA_DIR_RAW = IS_VERCEL ? VERCEL_TMP_DIR : process.env.DATA_DIR || './data';
+const DATA_DIR = IS_VERCEL ? VERCEL_TMP_DIR : path.resolve(process.cwd(), DATA_DIR_RAW);
 const HISTORICO_ARQUIVO = path.join(DATA_DIR, 'produtos_postados.json');
-const PASTA_SAIDA = path.resolve(process.cwd(), 'videos_renderizados');
+const PASTA_SAIDA = IS_VERCEL ? VERCEL_TMP_DIR : path.resolve(process.cwd(), 'videos_renderizados');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(PASTA_SAIDA, { recursive: true });
+function ensureStorageDirs(): void {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(PASTA_SAIDA, { recursive: true });
+}
+
+ensureStorageDirs();
+
+let cachedFfmpegAvailable: boolean | null = null;
+async function checkFfmpegAvailable(): Promise<boolean> {
+  if (process.env.DISABLE_FFMPEG === 'true') return false;
+  if (cachedFfmpegAvailable !== null) return cachedFfmpegAvailable;
+  try {
+    await execFileAsync('ffmpeg', ['-version'], { timeout: 2500 });
+    cachedFfmpegAvailable = true;
+  } catch {
+    cachedFfmpegAvailable = false;
+  }
+  return cachedFfmpegAvailable;
+}
+
+function isFfmpegMissingError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('ENOENT') || msg.includes('spawn ffmpeg');
+}
 
 interface RuntimeConfig {
   shopeeAppId: string;
@@ -100,6 +123,7 @@ function loadHistory(): PostedHistoryEntry[] {
 }
 
 function saveHistory(history: PostedHistoryEntry[]): void {
+  ensureStorageDirs();
   fs.writeFileSync(HISTORICO_ARQUIVO, JSON.stringify(history, null, 2), 'utf8');
 }
 
@@ -408,7 +432,15 @@ async function generateTtsWithGemini(
   text: string,
   voiceName: string,
   prefix: string
-): Promise<{ audioUrl: string; filename: string; filePath: string; durationSec: number; modelUsed: string }> {
+): Promise<{
+  audioUrl: string;
+  audioDataUrl: string;
+  filename: string;
+  filePath: string;
+  durationSec: number;
+  modelUsed: string;
+}> {
+  ensureStorageDirs();
   const ai = getAiClient();
   const safeVoice = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'].includes(voiceName)
     ? voiceName
@@ -441,9 +473,11 @@ async function generateTtsWithGemini(
   // 24kHz mono 16-bit PCM = 48000 bytes/sec after 44-byte RIFF header
   const pcmBytes = Math.max(0, wavBuffer.length - 44);
   const durationSec = Math.max(5, Math.min(35, Number((pcmBytes / 48000).toFixed(1))));
+  const audioDataUrl = `data:audio/wav;base64,${wavBuffer.toString('base64')}`;
 
   return {
-    audioUrl: `/api/media/${filename}`,
+    audioUrl: IS_VERCEL ? audioDataUrl : `/api/media/${filename}`,
+    audioDataUrl,
     filename,
     filePath,
     durationSec,
@@ -455,10 +489,15 @@ async function resolveImagePathForFfmpeg(imageUrl: string, prefix: string): Prom
   localPath: string;
   isTemp: boolean;
 }> {
+  ensureStorageDirs();
   if (imageUrl.startsWith('/src/assets/')) {
     const candidate = path.resolve(process.cwd(), imageUrl.slice(1));
     if (fs.existsSync(candidate)) {
       return { localPath: candidate, isTemp: false };
+    }
+    const distCandidate = path.resolve(process.cwd(), 'dist', imageUrl.slice(1));
+    if (fs.existsSync(distCandidate)) {
+      return { localPath: distCandidate, isTemp: false };
     }
   }
 
@@ -612,7 +651,11 @@ async function runSlotCycle(slotNumber: 1 | 2 | 3): Promise<{
   produto: ShopeeProduct;
   copy: VideoCopyPackage;
   audioUrl: string | null;
-  videoUrl: string;
+  audioFilename: string | null;
+  audioDuration: number;
+  videoUrl: string | null;
+  videoFilename: string | null;
+  requiresClientRender: boolean;
   historyEntry: PostedHistoryEntry;
   telegramDetail: string;
 }> {
@@ -646,18 +689,37 @@ async function runSlotCycle(slotNumber: 1 | 2 | 3): Promise<{
       console.warn('[TTS fallback]', ttsErr instanceof Error ? ttsErr.message : ttsErr);
     }
 
-    const video = await renderVideoWithFfmpeg({
-      produto,
-      prefix,
-      audioFilename,
-      durationSec,
-    });
+    let videoUrl: string | null = null;
+    let videoFilename: string | null = null;
+    let requiresClientRender = false;
+
+    const hasFfmpeg = await checkFfmpegAvailable();
+    if (hasFfmpeg) {
+      try {
+        const video = await renderVideoWithFfmpeg({
+          produto,
+          prefix,
+          audioFilename,
+          durationSec,
+        });
+        videoUrl = video.videoUrl;
+        videoFilename = video.filename;
+      } catch (ffErr) {
+        if (isFfmpegMissingError(ffErr)) {
+          requiresClientRender = true;
+        } else {
+          throw ffErr;
+        }
+      }
+    } else {
+      requiresClientRender = true;
+    }
 
     const telegramResult = await dispatchToTelegramIfConfigured({
       produto,
       copy,
       slot: slotNumber,
-      videoFilename: video.filename,
+      videoFilename,
     });
 
     const { legendaCompleta } = buildTelegramOperationalMessage(produto, copy, slotNumber);
@@ -669,7 +731,7 @@ async function runSlotCycle(slotNumber: 1 | 2 | 3): Promise<{
       offerLink: produto.offerLink,
       legendaCompleta,
       aigcLabel: copy.aigc_label,
-      videoUrl: video.videoUrl,
+      videoUrl,
       telegramSent: telegramResult.sent,
     };
 
@@ -686,7 +748,11 @@ async function runSlotCycle(slotNumber: 1 | 2 | 3): Promise<{
       produto,
       copy,
       audioUrl,
-      videoUrl: video.videoUrl,
+      audioFilename: audioFilename || null,
+      audioDuration: durationSec,
+      videoUrl,
+      videoFilename,
+      requiresClientRender,
       historyEntry: entry,
       telegramDetail: telegramResult.detail,
     };
@@ -700,13 +766,20 @@ async function runSlotCycle(slotNumber: 1 | 2 | 3): Promise<{
   }
 }
 
-async function startServer() {
-  const app = express();
-  app.use(express.json({ limit: '4mb' }));
+export const app = express();
+app.use(express.json({ limit: '4mb' }));
 
-  app.get('/api/state', (_req, res) => {
-    const history = loadHistory();
-    const renderedFiles = fs
+app.get('/api/state', async (_req, res) => {
+  ensureStorageDirs();
+  const history = loadHistory();
+  let renderedFiles: Array<{
+    filename: string;
+    videoUrl: string;
+    sizeBytes: number;
+    createdAt: string;
+  }> = [];
+  try {
+    renderedFiles = fs
       .readdirSync(PASTA_SAIDA)
       .filter((f) => f.endsWith('.mp4'))
       .map((f) => {
@@ -719,311 +792,243 @@ async function startServer() {
         };
       })
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    renderedFiles = [];
+  }
 
-    res.json({
-      catalog: sortProductsByPriority(cachedCatalog),
-      shopeeMode,
-      history,
-      slots,
-      renderedVideos: renderedFiles,
-      dataDir: DATA_DIR_RAW,
-      integrationsStatus: {
-        shopeeConfigured: Boolean(runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret),
-        telegramConfigured: Boolean(runtimeConfig.telegramBotToken && runtimeConfig.telegramChatId),
-        geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-        autoScheduleEnabled: runtimeConfig.autoScheduleEnabled,
-        shopeeAppIdPreview: runtimeConfig.shopeeAppId
-          ? `${runtimeConfig.shopeeAppId.slice(0, 4)}••••`
-          : '',
-        telegramChatId: runtimeConfig.telegramChatId || '',
-      },
-    });
+  const ffmpegAvailable = await checkFfmpegAvailable();
+
+  res.json({
+    catalog: sortProductsByPriority(cachedCatalog),
+    shopeeMode,
+    history,
+    slots,
+    renderedVideos: renderedFiles,
+    dataDir: DATA_DIR_RAW,
+    integrationsStatus: {
+      shopeeConfigured: Boolean(runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret),
+      telegramConfigured: Boolean(runtimeConfig.telegramBotToken && runtimeConfig.telegramChatId),
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      autoScheduleEnabled: runtimeConfig.autoScheduleEnabled,
+      shopeeAppIdPreview: runtimeConfig.shopeeAppId
+        ? `${runtimeConfig.shopeeAppId.slice(0, 4)}••••`
+        : '',
+      telegramChatId: runtimeConfig.telegramChatId || '',
+      ffmpegAvailable,
+    },
   });
+});
 
-  app.post('/api/shopee/sync', async (_req, res) => {
-    try {
-      if (runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret) {
-        const liveNodes = await fetchShopeeProductsLive(25);
-        cachedCatalog = sortProductsByPriority(liveNodes);
-        shopeeMode = 'live';
-        res.json({ catalog: cachedCatalog, shopeeMode });
-        return;
-      }
-      cachedCatalog = sortProductsByPriority(CATALOG_SEED_PRODUCTS);
-      shopeeMode = 'catalog';
+app.post('/api/shopee/sync', async (_req, res) => {
+  try {
+    if (runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret) {
+      const liveNodes = await fetchShopeeProductsLive(25);
+      cachedCatalog = sortProductsByPriority(liveNodes);
+      shopeeMode = 'live';
       res.json({ catalog: cachedCatalog, shopeeMode });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erro ao sincronizar catálogo Shopee';
-      res.status(502).json({ error: message });
+      return;
     }
-  });
+    cachedCatalog = sortProductsByPriority(CATALOG_SEED_PRODUCTS);
+    shopeeMode = 'catalog';
+    res.json({ catalog: cachedCatalog, shopeeMode });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Erro ao sincronizar catálogo Shopee';
+    res.status(502).json({ error: message });
+  }
+});
 
-  app.post('/api/ai/generate-copy', async (req, res) => {
-    try {
-      const { produto, slotNumber } = req.body as {
-        produto?: ShopeeProduct;
-        slotNumber?: number;
-      };
-      if (!produto || !produto.productName) {
-        res.status(400).json({ error: 'Produto inválido para geração de roteiro.' });
-        return;
-      }
-      const copy = await generateCopyWithGemini(produto, Number(slotNumber || 1));
-      res.json({ copy });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Falha na geração com Gemini.';
-      res.status(500).json({ error: message });
+app.post('/api/ai/generate-copy', async (req, res) => {
+  try {
+    const { produto, slotNumber } = req.body as {
+      produto?: ShopeeProduct;
+      slotNumber?: number;
+    };
+    if (!produto || !produto.productName) {
+      res.status(400).json({ error: 'Produto inválido para geração de roteiro.' });
+      return;
     }
-  });
+    const copy = await generateCopyWithGemini(produto, Number(slotNumber || 1));
+    res.json({ copy });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Falha na geração com Gemini.';
+    res.status(500).json({ error: message });
+  }
+});
 
-  app.post('/api/tts/generate', async (req, res) => {
-    try {
-      const { text, voiceName, itemId } = req.body as {
-        text?: string;
-        voiceName?: string;
-        itemId?: string;
-      };
-      if (!text || !text.trim()) {
-        res.status(400).json({ error: 'Texto da narração é obrigatório.' });
-        return;
-      }
-      const prefix = `tts_${String(itemId || 'manual').replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
-      const result = await generateTtsWithGemini(text.trim(), voiceName || 'Kore', prefix);
+app.post('/api/tts/generate', async (req, res) => {
+  try {
+    const { text, voiceName, itemId } = req.body as {
+      text?: string;
+      voiceName?: string;
+      itemId?: string;
+    };
+    if (!text || !text.trim()) {
+      res.status(400).json({ error: 'Texto da narração é obrigatório.' });
+      return;
+    }
+    const prefix = `tts_${String(itemId || 'manual').replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
+    const result = await generateTtsWithGemini(text.trim(), voiceName || 'Kore', prefix);
+    res.json({
+      audioUrl: result.audioUrl,
+      audioDataUrl: result.audioDataUrl,
+      filename: result.filename,
+      durationSec: result.durationSec,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Falha ao gerar locução neural.';
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/video/render', async (req, res) => {
+  const { produto, slotNumber, audioFilename, durationSec, forceBrowserFallback } = req.body as {
+    produto?: ShopeeProduct;
+    slotNumber?: number;
+    audioFilename?: string;
+    durationSec?: number;
+    forceBrowserFallback?: boolean;
+  };
+  if (!produto || !produto.itemId || !produto.imageUrl) {
+    res.status(400).json({ error: 'Produto e imagem são obrigatórios para renderizar MP4.' });
+    return;
+  }
+
+  const hasFfmpeg = !forceBrowserFallback && (await checkFfmpegAvailable());
+  if (!hasFfmpeg) {
+    res.json({
+      requiresClientRender: true,
+      engine: 'browser_canvas_fallback',
+      durationSec: Math.max(4, Math.min(28, Math.round(durationSec || 6))),
+      fallbackReason:
+        'FFmpeg nativo indisponível no servidor Serverless; gerando vídeo 9:16 com Ken Burns diretamente no navegador.',
+    });
+    return;
+  }
+
+  try {
+    const prefix = `slot${Number(slotNumber || 1)}_${String(produto.itemId).replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
+    const video = await renderVideoWithFfmpeg({
+      produto,
+      prefix,
+      audioFilename,
+      durationSec,
+    });
+    res.json(video);
+  } catch (err) {
+    if (isFfmpegMissingError(err)) {
       res.json({
-        audioUrl: result.audioUrl,
-        filename: result.filename,
-        durationSec: result.durationSec,
+        requiresClientRender: true,
+        engine: 'browser_canvas_fallback',
+        durationSec: Math.max(4, Math.min(28, Math.round(durationSec || 6))),
+        fallbackReason:
+          'FFmpeg nativo indisponível no servidor; gerando vídeo 9:16 com Ken Burns diretamente no navegador.',
       });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Falha ao gerar locução neural.';
-      res.status(500).json({ error: message });
+      return;
     }
-  });
+    const message = err instanceof Error ? err.message : 'Erro ao renderizar vídeo FFmpeg.';
+    res.status(500).json({ error: message });
+  }
+});
 
-  app.post('/api/video/render', async (req, res) => {
-    try {
-      const { produto, slotNumber, audioFilename, durationSec } = req.body as {
-        produto?: ShopeeProduct;
-        slotNumber?: number;
-        audioFilename?: string;
-        durationSec?: number;
-      };
-      if (!produto || !produto.itemId || !produto.imageUrl) {
-        res.status(400).json({ error: 'Produto e imagem são obrigatórios para renderizar MP4.' });
-        return;
-      }
-      const prefix = `slot${Number(slotNumber || 1)}_${String(produto.itemId).replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
-      const video = await renderVideoWithFfmpeg({
-        produto,
-        prefix,
-        audioFilename,
-        durationSec,
-      });
-      res.json(video);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erro ao renderizar vídeo FFmpeg.';
-      res.status(500).json({ error: message });
-    }
-  });
-
-  app.post('/api/flow/generate-veo', async (req, res) => {
-    const { produto, veoMasterPrompt, slotNumber, audioFilename, durationSec } = req.body as {
+app.post('/api/flow/generate-veo', async (req, res) => {
+  const { produto, veoMasterPrompt, slotNumber, audioFilename, durationSec, forceBrowserFallback } =
+    req.body as {
       produto?: ShopeeProduct;
       veoMasterPrompt?: string;
       slotNumber?: number;
       audioFilename?: string;
       durationSec?: number;
+      forceBrowserFallback?: boolean;
     };
 
-    if (!produto || !produto.itemId || !produto.imageUrl) {
-      res.status(400).json({ error: 'Produto e imagem são obrigatórios para gerar cena com Veo.' });
-      return;
-    }
+  if (!produto || !produto.itemId || !produto.imageUrl) {
+    res.status(400).json({ error: 'Produto e imagem são obrigatórios para gerar cena com Veo.' });
+    return;
+  }
 
-    const prefix = `veo_slot${Number(slotNumber || 1)}_${String(produto.itemId).replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
+  ensureStorageDirs();
+  const prefix = `veo_slot${Number(slotNumber || 1)}_${String(produto.itemId).replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
 
+  try {
+    const ai = getAiClient();
+    const { localPath: imgPath, isTemp } = await resolveImagePathForFfmpeg(produto.imageUrl, prefix);
+    let base64Image = '';
     try {
-      const ai = getAiClient();
-      const { localPath: imgPath, isTemp } = await resolveImagePathForFfmpeg(produto.imageUrl, prefix);
-      let base64Image = '';
-      try {
-        base64Image = fs.readFileSync(imgPath).toString('base64');
-      } finally {
-        if (isTemp && fs.existsSync(imgPath)) {
-          fs.unlinkSync(imgPath);
-        }
-      }
-
-      const prompt =
-        (veoMasterPrompt || '').trim() ||
-        `Vertical 9:16 photorealistic product showcase in a sunlit Brazilian home featuring ${produto.productName}, smooth camera push-in, natural textures.`;
-
-      let operation = await ai.models.generateVideos({
-        model: 'veo-2.0-generate-001',
-        prompt,
-        image: {
-          imageBytes: base64Image,
-          mimeType: 'image/jpeg',
-        },
-        config: {
-          aspectRatio: '9:16',
-          numberOfVideos: 1,
-        },
-      });
-
-      const pollDeadline = Date.now() + 90_000;
-      while (!operation.done && Date.now() < pollDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 6000));
-        operation = await ai.operations.getVideosOperation({ operation });
-      }
-
-      if (!operation.done || operation.error) {
-        throw new Error(
-          operation.error
-            ? JSON.stringify(operation.error)
-            : 'Tempo limite aguardando renderização Veo.'
-        );
-      }
-
-      const generated = operation.response?.generatedVideos?.[0]?.video;
-      const rawVeoPath = path.join(PASTA_SAIDA, `${prefix}_veo_raw.mp4`);
-
-      if (generated?.videoBytes) {
-        fs.writeFileSync(rawVeoPath, Buffer.from(generated.videoBytes, 'base64'));
-      } else if (generated?.uri) {
-        const videoRes = await fetch(generated.uri, {
-          headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
-        });
-        if (!videoRes.ok) {
-          throw new Error(`Falha ao baixar vídeo Veo (${videoRes.status}).`);
-        }
-        fs.writeFileSync(rawVeoPath, Buffer.from(await videoRes.arrayBuffer()));
-      } else {
-        throw new Error('Resposta Veo não retornou bytes ou URI do vídeo.');
-      }
-
-      const finalFilename = `${prefix}_final.mp4`;
-      const finalPath = path.join(PASTA_SAIDA, finalFilename);
-      const audioPath =
-        audioFilename && fs.existsSync(path.join(PASTA_SAIDA, path.basename(audioFilename)))
-          ? path.join(PASTA_SAIDA, path.basename(audioFilename))
-          : null;
-
-      try {
-        if (audioPath) {
-          await execFileAsync(
-            'ffmpeg',
-            [
-              '-y',
-              '-i',
-              rawVeoPath,
-              '-i',
-              audioPath,
-              '-vf',
-              'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p',
-              '-map',
-              '0:v:0',
-              '-map',
-              '1:a:0',
-              '-c:v',
-              'libx264',
-              '-preset',
-              'veryfast',
-              '-crf',
-              '24',
-              '-c:a',
-              'aac',
-              '-b:a',
-              '192k',
-              '-shortest',
-              '-movflags',
-              '+faststart',
-              finalPath,
-            ],
-            { timeout: 60000 }
-          );
-          if (fs.existsSync(rawVeoPath)) fs.unlinkSync(rawVeoPath);
-        } else {
-          fs.renameSync(rawVeoPath, finalPath);
-        }
-      } catch (muxErr) {
-        if (fs.existsSync(rawVeoPath) && !fs.existsSync(finalPath)) {
-          fs.renameSync(rawVeoPath, finalPath);
-        }
-        console.warn('[Veo audio mux warning]', muxErr);
-      }
-
-      const stat = fs.statSync(finalPath);
-      res.json({
-        videoUrl: `/api/media/${finalFilename}`,
-        filename: finalFilename,
-        sizeBytes: stat.size,
-        durationSec: durationSec || 8,
-        engine: 'veo_2',
-      });
-    } catch (veoErr) {
-      const reason = formatGeminiError(veoErr);
-      console.warn('[Veo fallback to FFmpeg Ken Burns]', reason);
-      try {
-        const fallbackVideo = await renderVideoWithFfmpeg({
-          produto,
-          prefix: `${prefix}_kb`,
-          audioFilename,
-          durationSec,
-        });
-        res.json({
-          ...fallbackVideo,
-          engine: 'ffmpeg_fallback',
-          fallbackReason:
-            'Veo 2.0 indisponível nesta chave/faturamento no momento; vídeo 9:16 gerado via FFmpeg Ken Burns automaticamente.',
-        });
-      } catch (ffErr) {
-        const ffMsg = ffErr instanceof Error ? ffErr.message : 'Erro no fallback FFmpeg.';
-        res.status(500).json({ error: `${reason} | Fallback FFmpeg falhou: ${ffMsg}` });
+      base64Image = fs.readFileSync(imgPath).toString('base64');
+    } finally {
+      if (isTemp && fs.existsSync(imgPath)) {
+        fs.unlinkSync(imgPath);
       }
     }
-  });
 
-  app.post(
-    '/api/flow/mux-custom-video',
-    express.raw({ type: ['video/mp4', 'application/octet-stream'], limit: '100mb' }),
-    async (req, res) => {
-      try {
-        const rawBody = req.body as Buffer;
-        if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
-          res.status(400).json({ error: 'Arquivo .mp4 vazio ou inválido.' });
-          return;
-        }
+    const prompt =
+      (veoMasterPrompt || '').trim() ||
+      `Vertical 9:16 photorealistic product showcase in a sunlit Brazilian home featuring ${produto.productName}, smooth camera push-in, natural textures.`;
 
-        const itemId = String(req.query.itemId || 'flow').replace(/[^a-zA-Z0-9_-]/g, '');
-        const slotNumber = Number(req.query.slotNumber || 1);
-        const audioFilename =
-          typeof req.query.audioFilename === 'string' && req.query.audioFilename.trim()
-            ? path.basename(req.query.audioFilename.trim())
-            : '';
+    let operation = await ai.models.generateVideos({
+      model: 'veo-2.0-generate-001',
+      prompt,
+      image: {
+        imageBytes: base64Image,
+        mimeType: 'image/jpeg',
+      },
+      config: {
+        aspectRatio: '9:16',
+        numberOfVideos: 1,
+      },
+    });
 
-        const prefix = `flow_slot${slotNumber}_${itemId}_${Date.now()}`;
-        const rawPath = path.join(PASTA_SAIDA, `${prefix}_upload.mp4`);
-        const finalFilename = `${prefix}_final.mp4`;
-        const finalPath = path.join(PASTA_SAIDA, finalFilename);
+    const pollDeadline = Date.now() + 90_000;
+    while (!operation.done && Date.now() < pollDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+      operation = await ai.operations.getVideosOperation({ operation });
+    }
 
-        fs.writeFileSync(rawPath, rawBody);
+    if (!operation.done || operation.error) {
+      throw new Error(
+        operation.error
+          ? JSON.stringify(operation.error)
+          : 'Tempo limite aguardando renderização Veo.'
+      );
+    }
 
-        const audioPath =
-          audioFilename && fs.existsSync(path.join(PASTA_SAIDA, audioFilename))
-            ? path.join(PASTA_SAIDA, audioFilename)
-            : null;
+    const generated = operation.response?.generatedVideos?.[0]?.video;
+    const rawVeoPath = path.join(PASTA_SAIDA, `${prefix}_veo_raw.mp4`);
 
-        const normalizeFilter =
-          'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p';
+    if (generated?.videoBytes) {
+      fs.writeFileSync(rawVeoPath, Buffer.from(generated.videoBytes, 'base64'));
+    } else if (generated?.uri) {
+      const videoRes = await fetch(generated.uri, {
+        headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
+      });
+      if (!videoRes.ok) {
+        throw new Error(`Falha ao baixar vídeo Veo (${videoRes.status}).`);
+      }
+      fs.writeFileSync(rawVeoPath, Buffer.from(await videoRes.arrayBuffer()));
+    } else {
+      throw new Error('Resposta Veo não retornou bytes ou URI do vídeo.');
+    }
 
-        const args: string[] = ['-y', '-i', rawPath];
-        if (audioPath) {
-          args.push(
+    const finalFilename = `${prefix}_final.mp4`;
+    const finalPath = path.join(PASTA_SAIDA, finalFilename);
+    const audioPath =
+      audioFilename && fs.existsSync(path.join(PASTA_SAIDA, path.basename(audioFilename)))
+        ? path.join(PASTA_SAIDA, path.basename(audioFilename))
+        : null;
+
+    const hasFfmpeg = await checkFfmpegAvailable();
+    try {
+      if (audioPath && hasFfmpeg) {
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-y',
+            '-i',
+            rawVeoPath,
             '-i',
             audioPath,
             '-vf',
-            normalizeFilter,
+            'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p',
             '-map',
             '0:v:0',
             '-map',
@@ -1041,195 +1046,346 @@ async function startServer() {
             '-shortest',
             '-movflags',
             '+faststart',
-            finalPath
-          );
-        } else {
-          args.push(
-            '-vf',
-            normalizeFilter,
-            '-c:v',
-            'libx264',
-            '-preset',
-            'veryfast',
-            '-crf',
-            '24',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '192k',
-            '-movflags',
-            '+faststart',
-            finalPath
-          );
-        }
-
-        try {
-          await execFileAsync('ffmpeg', args, { timeout: 90000 });
-        } finally {
-          if (fs.existsSync(rawPath)) {
-            fs.unlinkSync(rawPath);
-          }
-        }
-
-        const stat = fs.statSync(finalPath);
-        res.json({
-          videoUrl: `/api/media/${finalFilename}`,
-          filename: finalFilename,
-          sizeBytes: stat.size,
-          audioMuxed: Boolean(audioPath),
-          engine: 'google_flow_mux',
-        });
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Erro ao processar .mp4 do Google Flow com FFmpeg.';
-        res.status(500).json({ error: message });
+            finalPath,
+          ],
+          { timeout: 60000 }
+        );
+        if (fs.existsSync(rawVeoPath)) fs.unlinkSync(rawVeoPath);
+      } else {
+        fs.renameSync(rawVeoPath, finalPath);
       }
+    } catch (muxErr) {
+      if (fs.existsSync(rawVeoPath) && !fs.existsSync(finalPath)) {
+        fs.renameSync(rawVeoPath, finalPath);
+      }
+      console.warn('[Veo audio mux warning]', muxErr);
     }
-  );
 
-  app.post('/api/publish/dispatch', async (req, res) => {
-    try {
-      const { produto, copy, slotNumber, videoFilename, videoUrl } = req.body as {
-        produto?: ShopeeProduct;
-        copy?: VideoCopyPackage;
-        slotNumber?: number;
-        videoFilename?: string | null;
-        videoUrl?: string | null;
-      };
-      if (!produto || !copy) {
-        res.status(400).json({ error: 'Produto e roteiro são obrigatórios para publicação.' });
-        return;
-      }
-      const slot = Number(slotNumber || 1) as 1 | 2 | 3;
-      const telegram = await dispatchToTelegramIfConfigured({
-        produto,
-        copy,
-        slot,
-        videoFilename,
-      });
+    const stat = fs.statSync(finalPath);
+    res.json({
+      videoUrl: `/api/media/${finalFilename}`,
+      filename: finalFilename,
+      sizeBytes: stat.size,
+      durationSec: durationSec || 8,
+      engine: 'veo_2',
+    });
+  } catch (veoErr) {
+    const reason = formatGeminiError(veoErr);
+    console.warn('[Veo fallback]', reason);
 
-      const { legendaCompleta } = buildTelegramOperationalMessage(produto, copy, slot);
-      const history = loadHistory();
-      const entry: PostedHistoryEntry = {
-        itemId: produto.itemId,
-        productName: produto.productName,
-        slotNumber: slot,
-        postedAt: new Date().toISOString(),
-        offerLink: produto.offerLink,
-        legendaCompleta,
-        aigcLabel: copy.aigc_label,
-        videoUrl: videoUrl || null,
-        telegramSent: telegram.sent,
-      };
-      const nextHistory = appendHistory(history, entry);
-      saveHistory(nextHistory);
-
-      const slotObj = slots.find((s) => s.slot === slot);
-      if (slotObj) {
-        slotObj.lastStatus = 'completed';
-        slotObj.lastRunAt = entry.postedAt;
-        slotObj.lastProductId = produto.itemId;
-      }
-
+    const hasFfmpeg = !forceBrowserFallback && (await checkFfmpegAvailable());
+    if (!hasFfmpeg) {
       res.json({
-        history: nextHistory,
-        slots,
-        entry,
-        telegramDetail: telegram.detail,
+        requiresClientRender: true,
+        engine: 'browser_canvas_fallback',
+        durationSec: Math.max(4, Math.min(28, Math.round(durationSec || 6))),
+        fallbackReason:
+          'Veo 2.0 e FFmpeg nativo indisponíveis no servidor Serverless; gerando cena 9:16 com Ken Burns no navegador.',
       });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erro ao publicar pacote.';
-      res.status(500).json({ error: message });
-    }
-  });
-
-  app.post('/api/pipeline/run-slot', async (req, res) => {
-    try {
-      const { slotNumber } = req.body as { slotNumber?: number };
-      const slot = ([1, 2, 3].includes(Number(slotNumber)) ? Number(slotNumber) : 1) as 1 | 2 | 3;
-      const result = await runSlotCycle(slot);
-      res.json({
-        ...result,
-        history: loadHistory(),
-        slots,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Erro na execução automática do slot.';
-      res.status(500).json({ error: message, slots });
-    }
-  });
-
-  app.post('/api/history/remove', (req, res) => {
-    const { itemId } = req.body as { itemId?: string };
-    if (!itemId) {
-      res.status(400).json({ error: 'itemId é obrigatório.' });
       return;
     }
-    const nextHistory = loadHistory().filter((h) => h.itemId !== String(itemId));
-    saveHistory(nextHistory);
-    res.json({ history: nextHistory });
-  });
 
-  app.post('/api/history/clear', (_req, res) => {
-    saveHistory([]);
-    res.json({ history: [] });
-  });
-
-  app.post('/api/integrations/config', (req, res) => {
-    const body = req.body as {
-      shopeeAppId?: string;
-      shopeeAppSecret?: string;
-      telegramBotToken?: string;
-      telegramChatId?: string;
-      autoScheduleEnabled?: boolean;
-      slotToggles?: Array<{ slot: number; enabled: boolean }>;
-    };
-
-    if (typeof body.shopeeAppId === 'string') runtimeConfig.shopeeAppId = body.shopeeAppId.trim();
-    if (typeof body.shopeeAppSecret === 'string' && body.shopeeAppSecret.trim()) {
-      runtimeConfig.shopeeAppSecret = body.shopeeAppSecret.trim();
-    }
-    if (typeof body.telegramBotToken === 'string' && body.telegramBotToken.trim()) {
-      runtimeConfig.telegramBotToken = body.telegramBotToken.trim();
-    }
-    if (typeof body.telegramChatId === 'string') {
-      runtimeConfig.telegramChatId = body.telegramChatId.trim();
-    }
-    if (typeof body.autoScheduleEnabled === 'boolean') {
-      runtimeConfig.autoScheduleEnabled = body.autoScheduleEnabled;
-    }
-    if (Array.isArray(body.slotToggles)) {
-      for (const toggle of body.slotToggles) {
-        const target = slots.find((s) => s.slot === toggle.slot);
-        if (target) target.enabled = Boolean(toggle.enabled);
+    try {
+      const fallbackVideo = await renderVideoWithFfmpeg({
+        produto,
+        prefix: `${prefix}_kb`,
+        audioFilename,
+        durationSec,
+      });
+      res.json({
+        ...fallbackVideo,
+        engine: 'ffmpeg_fallback',
+        fallbackReason:
+          'Veo 2.0 indisponível nesta chave/faturamento no momento; vídeo 9:16 gerado via FFmpeg Ken Burns automaticamente.',
+      });
+    } catch (ffErr) {
+      if (isFfmpegMissingError(ffErr)) {
+        res.json({
+          requiresClientRender: true,
+          engine: 'browser_canvas_fallback',
+          durationSec: Math.max(4, Math.min(28, Math.round(durationSec || 6))),
+          fallbackReason:
+            'Veo 2.0 e FFmpeg nativo indisponíveis no servidor; gerando cena 9:16 com Ken Burns no navegador.',
+        });
+        return;
       }
+      const ffMsg = ffErr instanceof Error ? ffErr.message : 'Erro no fallback FFmpeg.';
+      res.status(500).json({ error: `${reason} | Fallback FFmpeg falhou: ${ffMsg}` });
+    }
+  }
+});
+
+app.post(
+  '/api/flow/mux-custom-video',
+  express.raw({ type: ['video/mp4', 'application/octet-stream'], limit: '100mb' }),
+  async (req, res) => {
+    const hasFfmpeg = await checkFfmpegAvailable();
+    if (!hasFfmpeg) {
+      res.json({
+        requiresClientRender: true,
+        engine: 'browser_canvas_fallback',
+        fallbackReason:
+          'FFmpeg nativo indisponível no servidor Serverless; processando vídeo 9:16 diretamente no navegador.',
+      });
+      return;
+    }
+
+    try {
+      ensureStorageDirs();
+      const rawBody = req.body as Buffer;
+      if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
+        res.status(400).json({ error: 'Arquivo .mp4 vazio ou inválido.' });
+        return;
+      }
+
+      const itemId = String(req.query.itemId || 'flow').replace(/[^a-zA-Z0-9_-]/g, '');
+      const slotNumber = Number(req.query.slotNumber || 1);
+      const audioFilename =
+        typeof req.query.audioFilename === 'string' && req.query.audioFilename.trim()
+          ? path.basename(req.query.audioFilename.trim())
+          : '';
+
+      const prefix = `flow_slot${slotNumber}_${itemId}_${Date.now()}`;
+      const rawPath = path.join(PASTA_SAIDA, `${prefix}_upload.mp4`);
+      const finalFilename = `${prefix}_final.mp4`;
+      const finalPath = path.join(PASTA_SAIDA, finalFilename);
+
+      fs.writeFileSync(rawPath, rawBody);
+
+      const audioPath =
+        audioFilename && fs.existsSync(path.join(PASTA_SAIDA, audioFilename))
+          ? path.join(PASTA_SAIDA, audioFilename)
+          : null;
+
+      const normalizeFilter =
+        'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p';
+
+      const args: string[] = ['-y', '-i', rawPath];
+      if (audioPath) {
+        args.push(
+          '-i',
+          audioPath,
+          '-vf',
+          normalizeFilter,
+          '-map',
+          '0:v:0',
+          '-map',
+          '1:a:0',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '24',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-shortest',
+          '-movflags',
+          '+faststart',
+          finalPath
+        );
+      } else {
+        args.push(
+          '-vf',
+          normalizeFilter,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '24',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-movflags',
+          '+faststart',
+          finalPath
+        );
+      }
+
+      try {
+        await execFileAsync('ffmpeg', args, { timeout: 90000 });
+      } finally {
+        if (fs.existsSync(rawPath)) {
+          fs.unlinkSync(rawPath);
+        }
+      }
+
+      const stat = fs.statSync(finalPath);
+      res.json({
+        videoUrl: `/api/media/${finalFilename}`,
+        filename: finalFilename,
+        sizeBytes: stat.size,
+        audioMuxed: Boolean(audioPath),
+        engine: 'google_flow_mux',
+      });
+    } catch (err) {
+      if (isFfmpegMissingError(err)) {
+        res.json({
+          requiresClientRender: true,
+          engine: 'browser_canvas_fallback',
+          fallbackReason:
+            'FFmpeg nativo indisponível no servidor; processando vídeo 9:16 diretamente no navegador.',
+        });
+        return;
+      }
+      const message =
+        err instanceof Error ? err.message : 'Erro ao processar .mp4 do Google Flow com FFmpeg.';
+      res.status(500).json({ error: message });
+    }
+  }
+);
+
+app.post('/api/publish/dispatch', async (req, res) => {
+  try {
+    const { produto, copy, slotNumber, videoFilename, videoUrl } = req.body as {
+      produto?: ShopeeProduct;
+      copy?: VideoCopyPackage;
+      slotNumber?: number;
+      videoFilename?: string | null;
+      videoUrl?: string | null;
+    };
+    if (!produto || !copy) {
+      res.status(400).json({ error: 'Produto e roteiro são obrigatórios para publicação.' });
+      return;
+    }
+    const slot = Number(slotNumber || 1) as 1 | 2 | 3;
+    const telegram = await dispatchToTelegramIfConfigured({
+      produto,
+      copy,
+      slot,
+      videoFilename,
+    });
+
+    const { legendaCompleta } = buildTelegramOperationalMessage(produto, copy, slot);
+    const history = loadHistory();
+    const entry: PostedHistoryEntry = {
+      itemId: produto.itemId,
+      productName: produto.productName,
+      slotNumber: slot,
+      postedAt: new Date().toISOString(),
+      offerLink: produto.offerLink,
+      legendaCompleta,
+      aigcLabel: copy.aigc_label,
+      videoUrl: videoUrl || null,
+      telegramSent: telegram.sent,
+    };
+    const nextHistory = appendHistory(history, entry);
+    saveHistory(nextHistory);
+
+    const slotObj = slots.find((s) => s.slot === slot);
+    if (slotObj) {
+      slotObj.lastStatus = 'completed';
+      slotObj.lastRunAt = entry.postedAt;
+      slotObj.lastProductId = produto.itemId;
     }
 
     res.json({
+      history: nextHistory,
       slots,
-      integrationsStatus: {
-        shopeeConfigured: Boolean(runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret),
-        telegramConfigured: Boolean(runtimeConfig.telegramBotToken && runtimeConfig.telegramChatId),
-        geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-        autoScheduleEnabled: runtimeConfig.autoScheduleEnabled,
-        shopeeAppIdPreview: runtimeConfig.shopeeAppId
-          ? `${runtimeConfig.shopeeAppId.slice(0, 4)}••••`
-          : '',
-        telegramChatId: runtimeConfig.telegramChatId || '',
-      },
+      entry,
+      telegramDetail: telegram.detail,
     });
-  });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Erro ao publicar pacote.';
+    res.status(500).json({ error: message });
+  }
+});
 
-  app.get('/api/media/:filename', (req, res) => {
-    const safeName = path.basename(req.params.filename);
-    const fullPath = path.join(PASTA_SAIDA, safeName);
-    if (!fs.existsSync(fullPath)) {
-      res.status(404).json({ error: 'Arquivo de mídia não encontrado.' });
-      return;
+app.post('/api/pipeline/run-slot', async (req, res) => {
+  try {
+    const { slotNumber } = req.body as { slotNumber?: number };
+    const slot = ([1, 2, 3].includes(Number(slotNumber)) ? Number(slotNumber) : 1) as 1 | 2 | 3;
+    const result = await runSlotCycle(slot);
+    res.json({
+      ...result,
+      history: loadHistory(),
+      slots,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Erro na execução automática do slot.';
+    res.status(500).json({ error: message, slots });
+  }
+});
+
+app.post('/api/history/remove', (req, res) => {
+  const { itemId } = req.body as { itemId?: string };
+  if (!itemId) {
+    res.status(400).json({ error: 'itemId é obrigatório.' });
+    return;
+  }
+  const nextHistory = loadHistory().filter((h) => h.itemId !== String(itemId));
+  saveHistory(nextHistory);
+  res.json({ history: nextHistory });
+});
+
+app.post('/api/history/clear', (_req, res) => {
+  saveHistory([]);
+  res.json({ history: [] });
+});
+
+app.post('/api/integrations/config', async (req, res) => {
+  const body = req.body as {
+    shopeeAppId?: string;
+    shopeeAppSecret?: string;
+    telegramBotToken?: string;
+    telegramChatId?: string;
+    autoScheduleEnabled?: boolean;
+    slotToggles?: Array<{ slot: number; enabled: boolean }>;
+  };
+
+  if (typeof body.shopeeAppId === 'string') runtimeConfig.shopeeAppId = body.shopeeAppId.trim();
+  if (typeof body.shopeeAppSecret === 'string' && body.shopeeAppSecret.trim()) {
+    runtimeConfig.shopeeAppSecret = body.shopeeAppSecret.trim();
+  }
+  if (typeof body.telegramBotToken === 'string' && body.telegramBotToken.trim()) {
+    runtimeConfig.telegramBotToken = body.telegramBotToken.trim();
+  }
+  if (typeof body.telegramChatId === 'string') {
+    runtimeConfig.telegramChatId = body.telegramChatId.trim();
+  }
+  if (typeof body.autoScheduleEnabled === 'boolean') {
+    runtimeConfig.autoScheduleEnabled = body.autoScheduleEnabled;
+  }
+  if (Array.isArray(body.slotToggles)) {
+    for (const toggle of body.slotToggles) {
+      const target = slots.find((s) => s.slot === toggle.slot);
+      if (target) target.enabled = Boolean(toggle.enabled);
     }
-    res.sendFile(fullPath);
-  });
+  }
 
+  const ffmpegAvailable = await checkFfmpegAvailable();
+
+  res.json({
+    slots,
+    integrationsStatus: {
+      shopeeConfigured: Boolean(runtimeConfig.shopeeAppId && runtimeConfig.shopeeAppSecret),
+      telegramConfigured: Boolean(runtimeConfig.telegramBotToken && runtimeConfig.telegramChatId),
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      autoScheduleEnabled: runtimeConfig.autoScheduleEnabled,
+      shopeeAppIdPreview: runtimeConfig.shopeeAppId
+        ? `${runtimeConfig.shopeeAppId.slice(0, 4)}••••`
+        : '',
+      telegramChatId: runtimeConfig.telegramChatId || '',
+      ffmpegAvailable,
+    },
+  });
+});
+
+app.get('/api/media/:filename', (req, res) => {
+  const safeName = path.basename(req.params.filename);
+  const fullPath = path.join(PASTA_SAIDA, safeName);
+  if (!fs.existsSync(fullPath)) {
+    res.status(404).json({ error: 'Arquivo de mídia não encontrado.' });
+    return;
+  }
+  res.sendFile(fullPath);
+});
+
+async function startServer() {
   // Scheduler loop every 30s (mirrors Python schedule.every().day.at("08:30" | "13:00" | "19:30"))
   setInterval(() => {
     if (!runtimeConfig.autoScheduleEnabled) return;
@@ -1258,6 +1414,7 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1270,7 +1427,11 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Erro fatal ao iniciar servidor:', err);
-  process.exit(1);
-});
+if (!IS_VERCEL) {
+  startServer().catch((err) => {
+    console.error('Erro fatal ao iniciar servidor:', err);
+    process.exit(1);
+  });
+}
+
+export default app;

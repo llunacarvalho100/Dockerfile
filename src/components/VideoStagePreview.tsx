@@ -22,6 +22,7 @@ interface VideoStagePreviewProps {
   audioUrl: string | null;
   audioFilename: string | null;
   videoUrl: string | null;
+  videoFilename?: string | null;
   isGeneratingAudio: boolean;
   isRenderingVideo: boolean;
   isGeneratingVeo: boolean;
@@ -40,6 +41,7 @@ export function VideoStagePreview({
   onVoiceChange,
   audioUrl,
   videoUrl,
+  videoFilename,
   isGeneratingAudio,
   isRenderingVideo,
   isGeneratingVeo,
@@ -314,11 +316,11 @@ export function VideoStagePreview({
         {videoUrl ? (
           <a
             href={videoUrl}
-            download
+            download={videoFilename || 'shopee-video-9x16.mp4'}
             className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-200 bg-slate-50 text-slate-800 hover:bg-slate-100 transition-colors whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>Baixar Vídeo MP4 (1080×1920)</span>
+            <span>Baixar Vídeo (1080×1920)</span>
           </a>
         ) : null}
       </div>
