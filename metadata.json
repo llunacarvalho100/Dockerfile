@@ -1,0 +1,8 @@
+{
+  "name": "Shopee Vídeo Studio — Automação de Afiliados",
+  "description": "Central de automação de vídeos verticais para Shopee Afiliados com curadoria GraphQL, roteiros com IA Gemini, locução neural, renderização 9:16 FFmpeg e disparo para Telegram.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
